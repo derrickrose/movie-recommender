@@ -1,0 +1,127 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: >-
+  AWS CloudFormation MWAA Environment Template
+
+Metadata:
+  Version: 0.0.3
+
+Parameters:
+  Env:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    Description: Environment name (dev, staging, or prod)
+  AirflowVersion:
+    Type: String
+    Default: '3.0.6'
+    AllowedValues:
+      - '2.8.1'
+      - '3.0.6'
+      - '2.7.2'
+      - '2.6.3'
+    Description: Apache Airflow version
+Mappings:
+  EnvironmentSettings:
+    dev:
+      EnvironmentClass: mw1.small
+      MinWorkers: 1
+      MaxWorkers: 2
+      Schedulers: 2
+    staging:
+      EnvironmentClass: mw1.medium
+      MinWorkers: 1
+      MaxWorkers: 5
+      Schedulers: 2
+    prod:
+      EnvironmentClass: mw1.large
+      MinWorkers: 2
+      MaxWorkers: 10
+      Schedulers: 2
+Resources:
+  # MWAA Environment
+  MWAAEnvironment:
+    Type: AWS::MWAA::Environment
+    Properties:
+      Name: !Sub '${Env}-miketriky-mwaa'
+      AirflowVersion: !Ref AirflowVersion
+
+      # Source S3 Bucket
+      SourceBucketArn: !ImportValue
+        Fn::Sub: '${Env}-miketriky-mwaa-bucket-arn'
+      DagS3Path: 'dags'
+      PluginsS3Path: 'plugins/plugins.zip'
+      RequirementsS3Path: 'requirements.txt'
+      StartupScriptS3Path: 'startup.sh'
+
+      # Execution Role
+      ExecutionRoleArn: !ImportValue
+        Fn::Sub: '${Env}-miketriky-mwaa-execution-role-arn'
+
+      # Network Configuration
+      NetworkConfiguration:
+        SubnetIds:
+          - !ImportValue
+              Fn::Sub: '${Env}-miketriky-vpc-subnet-private-a-id'
+          - !ImportValue
+              Fn::Sub: '${Env}-miketriky-vpc-subnet-private-b-id'
+        SecurityGroupIds:
+          - !ImportValue
+              Fn::Sub: '${Env}-miketriky-vpc-sg-mwaa-id'
+
+      # Environment Class and Workers
+      EnvironmentClass: !FindInMap [EnvironmentSettings, !Ref Env, EnvironmentClass]
+      MinWorkers: !FindInMap [EnvironmentSettings, !Ref Env, MinWorkers]
+      MaxWorkers: !FindInMap [EnvironmentSettings, !Ref Env, MaxWorkers]
+      Schedulers: !FindInMap [EnvironmentSettings, !Ref Env, Schedulers]
+
+      # Web Server Access Mode
+      WebserverAccessMode: PUBLIC_ONLY
+
+      # Logging Configuration
+      LoggingConfiguration:
+        DagProcessingLogs:
+          Enabled: true
+          LogLevel: INFO
+        SchedulerLogs:
+          Enabled: true
+          LogLevel: INFO
+        TaskLogs:
+          Enabled: true
+          LogLevel: INFO
+        WebserverLogs:
+          Enabled: true
+          LogLevel: INFO
+        WorkerLogs:
+          Enabled: true
+          LogLevel: INFO
+
+      # Airflow Configuration Options
+      AirflowConfigurationOptions:
+        core.lazy_load_plugins: 'False'
+        core.default_timezone: 'UTC'
+        webserver.expose_config: 'True'
+        scheduler.dag_dir_list_interval: '300'
+
+      Tags:
+        Name: !Sub '${Env}-miketriky-mwaa-environment'
+        Environment: !Ref Env
+
+Outputs:
+  MWAAEnvironmentArn:
+    Description: MWAA Environment ARN
+    Value: !GetAtt MWAAEnvironment.Arn
+    Export:
+      Name: !Sub '${Env}-miketriky-mwaa-environment-arn'
+  MWAAEnvironmentName:
+    Description: MWAA Environment Name
+    Value: !Ref MWAAEnvironment
+    Export:
+      Name: !Sub '${Env}-miketriky-mwaa-environment-name'
+  MWAAWebServerUrl:
+    Description: MWAA Web Server URL
+    Value: !GetAtt MWAAEnvironment.WebserverUrl
+    Export:
+      Name: !Sub '${Env}-miketriky-mwaa-webserver-url'

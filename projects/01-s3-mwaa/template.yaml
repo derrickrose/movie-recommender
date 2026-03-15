@@ -1,0 +1,48 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: >-
+  AWS CloudFormation S3 Template for MWAA
+
+Metadata:
+  Version: 0.0.1
+
+Parameters:
+  Env:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    Description: Environment name (dev, staging, or prod)
+Resources:
+  # S3 Bucket for MWAA
+  MWAABucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${Env}-miketriky-${AWS::Region}-mwaa'
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      Tags:
+        - Key: Name
+          Value: !Sub '${Env}-miketriky-mwaa-bucket'
+
+Outputs:
+  MWAABucketName:
+    Description: MWAA S3 Bucket Name
+    Value: !Ref MWAABucket
+    Export:
+      Name: !Sub '${Env}-miketriky-mwaa-bucket-name'
+  MWAABucketArn:
+    Description: MWAA S3 Bucket ARN
+    Value: !GetAtt MWAABucket.Arn
+    Export:
+      Name: !Sub '${Env}-miketriky-mwaa-bucket-arn'

@@ -1,0 +1,78 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: >-
+  AWS CloudFormation ECR Template for MWAA Custom Image
+
+Metadata:
+  Version: 0.0.1
+
+Parameters:
+  Env:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    Description: Environment name (dev, staging, or prod)
+Mappings:
+  EnvironmentSettings:
+    dev:
+      ImageTagMutability: MUTABLE
+      ImageRetentionCount: 2
+    staging:
+      ImageTagMutability: MUTABLE
+      ImageRetentionCount: 5
+    prod:
+      ImageTagMutability: IMMUTABLE
+      ImageRetentionCount: 5
+Resources:
+  # ECR Repository for MWAA Custom Image
+  MWAAImageRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub '${Env}-miketriky-mwaa-image'
+      ImageTagMutability: !FindInMap [EnvironmentSettings, !Ref Env, ImageTagMutability]
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      EncryptionConfiguration:
+        EncryptionType: AES256
+      LifecyclePolicy:
+        LifecyclePolicyText: !Sub
+          - |
+            {
+              "rules": [
+                {
+                  "rulePriority": 1,
+                  "description": "Keep last ${Count} images",
+                  "selection": {
+                    "tagStatus": "any",
+                    "countType": "imageCountMoreThan",
+                    "countNumber": ${Count}
+                  },
+                  "action": {
+                    "type": "expire"
+                  }
+                }
+              ]
+            }
+          - Count: !FindInMap [EnvironmentSettings, !Ref Env, ImageRetentionCount]
+      Tags:
+        - Key: Name
+          Value: !Sub '${Env}-miketriky-mwaa-image-repo'
+
+Outputs:
+  ECRRepositoryUri:
+    Description: ECR Repository URI
+    Value: !GetAtt MWAAImageRepository.RepositoryUri
+    Export:
+      Name: !Sub '${Env}-miketriky-ecr-mwaa-uri'
+  ECRRepositoryArn:
+    Description: ECR Repository ARN
+    Value: !GetAtt MWAAImageRepository.Arn
+    Export:
+      Name: !Sub '${Env}-miketriky-ecr-mwaa-arn'
+  ECRRepositoryName:
+    Description: ECR Repository Name
+    Value: !Ref MWAAImageRepository
+    Export:
+      Name: !Sub '${Env}-miketriky-ecr-mwaa-name'

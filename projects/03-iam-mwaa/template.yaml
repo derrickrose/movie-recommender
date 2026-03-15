@@ -1,0 +1,163 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: >-
+  AWS CloudFormation IAM Role Template for MWAA
+
+Metadata:
+  Version: 0.0.1
+
+Parameters:
+  Env:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    Description: Environment name (dev, staging, or prod)
+Resources:
+  # IAM Role for MWAA Execution
+  MWAAExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${Env}-miketriky-mwaa-execution-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - airflow.amazonaws.com
+                - airflow-env.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy'
+      Tags:
+        - Key: Name
+          Value: !Sub '${Env}-miketriky-mwaa-execution-role'
+
+  # Policy for S3 Access (DAGs, Plugins, Requirements)
+  MWAAs3Policy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub '${Env}-miketriky-mwaa-s3-policy'
+      Roles:
+        - !Ref MWAAExecutionRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - 's3:GetObject*'
+              - 's3:GetBucket*'
+              - 's3:List*'
+            Resource:
+              - !Sub
+                - 'arn:aws:s3:::${BucketName}'
+                - BucketName:
+                    Fn::ImportValue: !Sub '${Env}-miketriky-mwaa-bucket-name'
+              - !Sub
+                - 'arn:aws:s3:::${BucketName}/*'
+                - BucketName:
+                    Fn::ImportValue: !Sub '${Env}-miketriky-mwaa-bucket-name'
+          - Effect: Allow
+            Action:
+              - 's3:PutObject'
+            Resource:
+              - !Sub
+                - 'arn:aws:s3:::${BucketName}/*'
+                - BucketName:
+                    Fn::ImportValue: !Sub '${Env}-miketriky-mwaa-bucket-name'
+
+  # Policy for CloudWatch Logs
+  MWAALogsPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub '${Env}-miketriky-mwaa-logs-policy'
+      Roles:
+        - !Ref MWAAExecutionRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - 'logs:CreateLogStream'
+              - 'logs:CreateLogGroup'
+              - 'logs:PutLogEvents'
+              - 'logs:GetLogEvents'
+              - 'logs:GetLogRecord'
+              - 'logs:GetLogGroupFields'
+              - 'logs:GetQueryResults'
+              - 'logs:DescribeLogGroups'
+            Resource:
+              - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:airflow-${Env}-*'
+
+  # Policy for VPC/Network Interface (Required for MWAA in VPC)
+  MWAAVPCPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub '${Env}-miketriky-mwaa-vpc-policy'
+      Roles:
+        - !Ref MWAAExecutionRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - 'ec2:CreateNetworkInterface'
+              - 'ec2:DescribeNetworkInterfaces'
+              - 'ec2:DeleteNetworkInterface'
+              - 'ec2:DescribeSubnets'
+              - 'ec2:DescribeVpcs'
+              - 'ec2:DescribeSecurityGroups'
+              - 'ec2:CreateNetworkInterfacePermission'
+            Resource: '*'
+
+  # Policy for MWAA Environment Management
+  MWAAEnvironmentPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub '${Env}-miketriky-mwaa-environment-policy'
+      Roles:
+        - !Ref MWAAExecutionRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - 'airflow:PublishMetrics'
+            Resource:
+              - !Sub 'arn:aws:airflow:${AWS::Region}:${AWS::AccountId}:environment/${Env}-miketriky-mwaa'
+          - Effect: Allow
+            Action:
+              - 'sqs:ChangeMessageVisibility'
+              - 'sqs:DeleteMessage'
+              - 'sqs:GetQueueAttributes'
+              - 'sqs:GetQueueUrl'
+              - 'sqs:ReceiveMessage'
+              - 'sqs:SendMessage'
+            Resource:
+              - !Sub 'arn:aws:sqs:${AWS::Region}:*:airflow-celery-*'
+          - Effect: Allow
+            Action:
+              - 'kms:Decrypt'
+              - 'kms:DescribeKey'
+              - 'kms:GenerateDataKey*'
+              - 'kms:Encrypt'
+            NotResource: !Sub 'arn:aws:kms:*:${AWS::AccountId}:key/*'
+            Condition:
+              StringLike:
+                'kms:ViaService':
+                  - !Sub 'sqs.${AWS::Region}.amazonaws.com'
+
+Outputs:
+  MWAAExecutionRoleArn:
+    Description: MWAA Execution Role ARN
+    Value: !GetAtt MWAAExecutionRole.Arn
+    Export:
+      Name: !Sub '${Env}-miketriky-mwaa-execution-role-arn'
+  MWAAExecutionRoleName:
+    Description: MWAA Execution Role Name
+    Value: !Ref MWAAExecutionRole
+    Export:
+      Name: !Sub '${Env}-miketriky-mwaa-execution-role-name'

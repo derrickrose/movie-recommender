@@ -1,0 +1,1793 @@
+---
+AWSTemplateFormatVersion: 2010-09-09
+Description: Deploy the after banking platform with the protected resources (S3 buckets)
+
+Metadata:
+  Version: 1.0.9
+
+Parameters:
+  # List of environments
+  Env:
+    Type: String
+    Description: The name of the stack environment
+    Default: test
+    AllowedValues:
+      - test
+      - prod
+      - dev
+
+  Service:
+    Type: String
+    Description: Service
+    Default: restitution
+
+  CloudTrailBucketName:
+    Type: String
+    Description: Name of the S3 bucket used for centralized S3 Buckets logging
+    Default: aws-cloudtrail-logs-905418166282-eu-central-1
+
+Conditions:
+  IsTest: !Equals [ !Ref Env, 'test' ]
+  IsDev: !Equals [ !Ref Env, 'dev' ]
+  IsProd: !Equals [ !Ref Env, 'prod' ]
+
+Resources:
+  # Amazon Athena automatically stores query results and metadata information in an S3 bucket
+  # we use a separeted bucket for this purpose
+  AthenaQueryResultsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "fr-${Env}-${AWS::Region}-after-banking-athena-query-results"
+
+      # Ensure the bucket is private
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+      # Enable the versioning
+      VersioningConfiguration:
+        Status: Enabled
+
+      # Enable the S3 Analytics
+      AnalyticsConfigurations:
+        - Id: DashboardAnalyticsConfig
+          StorageClassAnalysis: {}
+          Prefix: AnalyticsConfigurationPrefix
+
+      # Encrypt the objects with SSE-KMS key
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: "aws:kms"             # the objects will be encrypted with the SSE-KMS key managed by AWS
+              KMSMasterKeyID: "alias/aws/s3"
+            BucketKeyEnabled: true
+
+      # Lifecycle
+      LifecycleConfiguration:
+        Rules:
+          # Move the objects greater than 128 KB to the Intellignet Tiering Storage Class
+          - Id: MoveToIntelligentTieringAfter30Days
+            Status: Enabled
+            ObjectSizeGreaterThan: 131073 # bytes (this is the minimal allowed value) > 128 KB
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: INTELLIGENT_TIERING
+
+          - Id: PurgeObjectsAfter30Days
+            Status: Enabled
+            Prefix: ""
+            ExpirationInDays: 30
+            NoncurrentVersionExpirationInDays: 30
+
+  AthenaQueryResultsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AthenaQueryResultsBucket
+      PolicyDocument:
+        Statement:
+          # Only SSL requests are allowed
+          - Sid: AllowSSLRequestsOnly
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !GetAtt AthenaQueryResultsBucket.Arn
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+
+          # Grant Access to the Root Account
+          - Sid: AllowRootAccountAccess
+            Effect: Allow
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt AthenaQueryResultsBucket.Arn
+              - !Sub "${AthenaQueryResultsBucket.Arn}/*"
+            Condition:
+              StringEquals:
+                  aws:userId: !Sub ${AWS::AccountId}
+
+          # This statement is only applied in the 'test' environment.
+          - !If
+            - IsTest
+            # Grant Admin access to the given principals
+            - Sid: AllowAdminAccess
+              Effect: Allow
+              Principal: '*'
+              Action: 's3:*'
+              Resource:
+                - !GetAtt AthenaQueryResultsBucket.Arn
+                - !Sub "${AthenaQueryResultsBucket.Arn}/*"
+              Condition:
+                ArnEquals:
+                  aws:PrincipalArn:
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/aws-reserved/sso.amazonaws.com/eu-central-1/AWSReservedSSO_fr-prod-eu-central-1-admin_f4c13ac1ef030905"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/after-banking-${Service}-${Env}-CloudFormationExecutionRole"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:user/ludovic.lempereur"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:user/geoffray.menudier"
+            - !Ref "AWS::NoValue" # If not test, no statement
+
+          # Deny Access to all users except specified ones
+          # This statement is only applied in the 'test' environment.
+          - !If
+            - IsTest
+            - Sid: DenyAllButAllowedUser
+              Effect: Deny
+              Principal: '*'
+              Action: 's3:*'
+              Resource:
+                - !GetAtt AthenaQueryResultsBucket.Arn
+                - !Sub "${AthenaQueryResultsBucket.Arn}/*"
+              Condition:
+                StringNotEquals:
+                  aws:userId: !Sub ${AWS::AccountId}
+                ArnNotEquals:
+                  aws:PrincipalArn:
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/aws-reserved/sso.amazonaws.com/eu-central-1/AWSReservedSSO_fr_test_data_engineer_0cdf13deb99966bf"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/aws-reserved/sso.amazonaws.com/eu-central-1/AWSReservedSSO_fr-prod-eu-central-1-admin_f4c13ac1ef030905"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/after-banking-${Service}-${Env}-CloudFormationExecutionRole"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/service-role/aws-quicksight-s3-consumers-role-v0"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-restitution-stepfunction-exec-main-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-migration-stepfunction-exec-main-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-llm-tagging-stepfunctions-exec-main-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:user/ludovic.lempereur"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:user/geoffray.menudier"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-zip-lambda-exec-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-inventory-tagging-lambda-exec-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-tessi-raw-to-intermediate-lambda-ex-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-migration-stepfunction-exec-main-role-2"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-loancession-stepfunction-exec-main-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-loancession-stepfunction-exec-main-role-opt"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-common-create-view-lambda-exec-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-unload-partitioned-data-lambda-ex-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-purge-stepfunction-exec-main-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-afterbanking-promote-to-gold-sfn-exec-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-purge-client-doc-lambda-exec-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-afterbanking-purge-client-doc-sfn-exec-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-promote-rattrapage-role"
+
+            - !Ref "AWS::NoValue" # If not test, no statement
+
+          # Deny Access to all users except admin and specified ones
+          # This statement is only applied in the 'test' environment
+          - !If
+            - IsTest
+            - Sid: DenyWriteAllButAdminAndRootUsers
+              Effect: Deny
+              Principal: '*'
+              NotAction:
+                - s3:List*
+                - s3:Get*
+              Resource:
+                - !GetAtt AthenaQueryResultsBucket.Arn
+                - !Sub "${AthenaQueryResultsBucket.Arn}/*"
+              Condition:
+                StringNotEquals:
+                  aws:userId: !Sub ${AWS::AccountId}
+                ArnNotEquals:
+                  aws:PrincipalArn:
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/aws-reserved/sso.amazonaws.com/eu-central-1/AWSReservedSSO_fr-prod-eu-central-1-admin_f4c13ac1ef030905"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/aws-reserved/sso.amazonaws.com/eu-central-1/AWSReservedSSO_fr_test_data_engineer_0cdf13deb99966bf"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/after-banking-${Service}-${Env}-CloudFormationExecutionRole"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/service-role/aws-quicksight-s3-consumers-role-v0"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-restitution-stepfunction-exec-main-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-migration-stepfunction-exec-main-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-llm-tagging-stepfunctions-exec-main-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:user/ludovic.lempereur"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:user/geoffray.menudier"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-tessi-raw-to-intermediate-lambda-ex-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-migration-stepfunction-exec-main-role-2"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-loancession-stepfunction-exec-main-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-loancession-stepfunction-exec-main-role-opt"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-common-create-view-lambda-exec-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-unload-partitioned-data-lambda-ex-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-purge-stepfunction-exec-main-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-afterbanking-promote-to-gold-sfn-exec-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-purge-client-doc-lambda-exec-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-afterbanking-purge-client-doc-sfn-exec-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-promote-rattrapage-role"
+
+            - !Ref "AWS::NoValue" # If not test, no statement
+
+          # Deny Policy for Quicksight
+          # This statement is only applied in the 'test' environment
+          - !If
+            - IsTest
+            - Sid: DenyAllWriteButQuickSightRequired
+              Effect: Deny
+              Principal: '*'
+              NotAction:
+                - s3:AbortMultipartUpload
+                - s3:PutObject
+                - s3:PutBucketPublicAccessBlock
+                - s3:GetBucketLocation
+                - s3:GetObject
+                - s3:GetObjectVersion
+                - s3:ListObject
+                - s3:ListBucket
+                - s3:ListMultipartUploadParts
+                - s3:ListBucketMultipartUploads
+              Resource:
+                - !GetAtt AthenaQueryResultsBucket.Arn
+                - !Sub "${AthenaQueryResultsBucket.Arn}/*"
+              Condition:
+                ArnEquals:
+                  aws:PrincipalArn: !Sub "arn:aws:iam::${AWS::AccountId}:role/service-role/aws-quicksight-s3-consumers-role-v0"
+            - !Ref "AWS::NoValue" # If not test, no statement
+
+          # Deny Policy for Get/Put actions
+          # This statement is only applied in the 'test' environment
+          - !If
+            - IsTest
+            - Sid: BlockAthenaDownloads
+              Effect: Deny
+              Principal: '*'
+              Action:
+                - s3:GetObject
+                - s3:PutObject
+              Resource:
+                - !GetAtt AthenaQueryResultsBucket.Arn
+                - !Sub "${AthenaQueryResultsBucket.Arn}/*"
+              Condition:
+                StringNotEquals:
+                  aws:calledViaLast: athena.amazonaws.com
+                ArnEquals:
+                  aws:PrincipalArn:
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/aws-reserved/sso.amazonaws.com/eu-central-1/AWSReservedSSO_fr_test_data_engineer_0cdf13deb99966bf"
+            - !Ref "AWS::NoValue" # If not test, no statement
+
+          # Allow Policy for Get/Put actions
+          # This statement is only applied in the 'test' environment
+          - !If
+            - IsTest
+            - Sid: AllowOnlyAthenaDownloads
+              Effect: Allow
+              Principal: '*'
+              Action:
+                - s3:GetObject
+                - s3:PutObject
+              Resource:
+                - !GetAtt AthenaQueryResultsBucket.Arn
+                - !Sub "${AthenaQueryResultsBucket.Arn}/*"
+              Condition:
+                StringEquals:
+                  aws:calledViaLast: athena.amazonaws.com
+                ArnEquals:
+                  aws:PrincipalArn:
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/aws-reserved/sso.amazonaws.com/eu-central-1/AWSReservedSSO_fr_test_data_engineer_0cdf13deb99966bf"
+            - !Ref "AWS::NoValue" # If not test, no statement
+
+          # This statement is only applied in the 'prod' environment.
+          - !If
+            - IsProd
+            # Grant Admin access to the given principals
+            - Sid: AllowAdminAccess
+              Effect: Allow
+              Principal: '*'
+              Action: 's3:*'
+              Resource:
+                - !GetAtt AthenaQueryResultsBucket.Arn
+                - !Sub "${AthenaQueryResultsBucket.Arn}/*"
+              Condition:
+                ArnEquals:
+                  aws:PrincipalArn:
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/aws-reserved/sso.amazonaws.com/eu-central-1/AWSReservedSSO_fr-prod-eu-central-1-admin_f4c13ac1ef030905"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/after-banking-${Service}-${Env}-CloudFormationExecutionRole"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:user/ludovic.lempereur"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:user/geoffray.menudier"
+            - !Ref "AWS::NoValue" # If not prod, no statement
+
+          # Deny Access to all users except specified ones
+          # This statement is only applied in the 'prod' environment.
+          - !If
+            - IsProd
+            - Sid: DenyAllButAllowedUser
+              Effect: Deny
+              Principal: '*'
+              Action: 's3:*'
+              Resource:
+                - !GetAtt AthenaQueryResultsBucket.Arn
+                - !Sub "${AthenaQueryResultsBucket.Arn}/*"
+              Condition:
+                StringNotEquals:
+                  aws:userId: !Sub ${AWS::AccountId}
+                ArnNotEquals:
+                  aws:PrincipalArn:
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/aws-reserved/sso.amazonaws.com/eu-central-1/AWSReservedSSO_fr-prod-eu-central-1-admin_f4c13ac1ef030905"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/aws-reserved/sso.amazonaws.com/eu-central-1/AWSReservedSSO_fr-tessi-control-temp_571f4e267db2c7db"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/aws-reserved/sso.amazonaws.com/eu-central-1/AWSReservedSSO_fr_prod_data_engineer_cc3919e7405e2c99"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/aws-reserved/sso.amazonaws.com/eu-central-1/AWSReservedSSO_fr_prod_data_analyst_15ed2db26f45ffbc"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/after-banking-${Service}-${Env}-CloudFormationExecutionRole"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:user/ludovic.lempereur"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:user/geoffray.menudier"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-restitution-stepfunction-exec-main-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-migration-stepfunction-exec-main-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-llm-tagging-stepfunctions-exec-main-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/service-role/aws-quicksight-s3-consumers-role-v0"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-zip-lambda-exec-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-inventory-tagging-lambda-exec-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-tessi-raw-to-intermediate-lambda-ex-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-migration-stepfunction-exec-main-role-2"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-loancession-stepfunction-exec-main-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-loancession-stepfunction-exec-main-role-opt"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-common-create-view-lambda-exec-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-unload-partitioned-data-lambda-ex-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-purge-stepfunction-exec-main-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-afterbanking-promote-to-gold-sfn-exec-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-purge-client-doc-lambda-exec-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-afterbanking-purge-client-doc-sfn-exec-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-promote-rattrapage-role"
+
+            - !Ref "AWS::NoValue" # If not prod, no statement
+
+          # Deny Access to all users except admin and specified ones
+          # This statement is only applied in the 'prod' environment
+          - !If
+            - IsProd
+            - Sid: DenyWriteAllButAdminAndRootUsers
+              Effect: Deny
+              Principal: '*'
+              NotAction:
+                - s3:List*
+                - s3:Get*
+                - s3:Put*
+              Resource:
+                - !GetAtt AthenaQueryResultsBucket.Arn
+                - !Sub "${AthenaQueryResultsBucket.Arn}/*"
+              Condition:
+                StringNotEquals:
+                  aws:userId: !Sub ${AWS::AccountId}
+                ArnNotEquals:
+                  aws:PrincipalArn:
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/aws-reserved/sso.amazonaws.com/eu-central-1/AWSReservedSSO_fr-prod-eu-central-1-admin_f4c13ac1ef030905"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/after-banking-${Service}-${Env}-CloudFormationExecutionRole"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:user/ludovic.lempereur"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:user/geoffray.menudier"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-restitution-stepfunction-exec-main-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-migration-stepfunction-exec-main-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-llm-tagging-stepfunctions-exec-main-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-tessi-raw-to-intermediate-lambda-ex-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-migration-stepfunction-exec-main-role-2"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-loancession-stepfunction-exec-main-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-loancession-stepfunction-exec-main-role-opt"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-common-create-view-lambda-exec-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-unload-partitioned-data-lambda-ex-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-purge-stepfunction-exec-main-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-afterbanking-promote-to-gold-sfn-exec-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-purge-client-doc-lambda-exec-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-afterbanking-purge-client-doc-sfn-exec-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-promote-rattrapage-role"
+
+            - !Ref "AWS::NoValue" # If not prod, no statement
+
+          # Deny Policy for Get/Put actions
+          # This statement is only applied in the 'prod' environment
+          - !If
+            - IsProd
+            - Sid: BlockAthenaDownloads
+              Effect: Deny
+              Principal: '*'
+              Action:
+                - s3:GetObject
+                - s3:PutObject
+              Resource:
+                - !GetAtt AthenaQueryResultsBucket.Arn
+                - !Sub "${AthenaQueryResultsBucket.Arn}/*"
+              Condition:
+                StringNotEquals:
+                  aws:calledViaLast: athena.amazonaws.com
+                ArnEquals:
+                  aws:PrincipalArn:
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/aws-reserved/sso.amazonaws.com/eu-central-1/AWSReservedSSO_fr_prod_data_engineer_cc3919e7405e2c99"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/aws-reserved/sso.amazonaws.com/eu-central-1/AWSReservedSSO_fr-tessi-control-temp_571f4e267db2c7db"
+            - !Ref "AWS::NoValue" # If not prod, no statement
+
+          # Allow Policy for Get/Put actions
+          # This statement is only applied in the 'prod' environment
+          - !If
+            - IsProd
+            - Sid: AllowOnlyAthenaDownloads
+              Effect: Allow
+              Principal: '*'
+              Action:
+                - s3:GetObject
+                - s3:PutObject
+              Resource:
+                - !GetAtt AthenaQueryResultsBucket.Arn
+                - !Sub "${AthenaQueryResultsBucket.Arn}/*"
+              Condition:
+                StringEquals:
+                  aws:calledViaLast: athena.amazonaws.com
+                ArnEquals:
+                  aws:PrincipalArn:
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/aws-reserved/sso.amazonaws.com/eu-central-1/AWSReservedSSO_fr_prod_data_engineer_cc3919e7405e2c99"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/aws-reserved/sso.amazonaws.com/eu-central-1/AWSReservedSSO_fr-tessi-control-temp_571f4e267db2c7db"
+            - !Ref "AWS::NoValue" # If not prod, no statement
+
+          # Deny Policy for Quicksight
+          # This statement is only applied in the 'prod' environment
+          - !If
+            - IsProd
+            - Sid: DenyAllWriteButQuickSightRequired
+              Effect: Deny
+              Principal: '*'
+              NotAction:
+                - s3:AbortMultipartUpload
+                - s3:PutObject
+                - s3:PutBucketPublicAccessBlock
+                - s3:GetBucketLocation
+                - s3:GetObject
+                - s3:GetObjectVersion
+                - s3:ListObject
+                - s3:ListBucket
+                - s3:ListMultipartUploadParts
+                - s3:ListBucketMultipartUploads
+              Resource:
+                - !GetAtt AthenaQueryResultsBucket.Arn
+                - !Sub "${AthenaQueryResultsBucket.Arn}/*"
+              Condition:
+                ArnEquals:
+                  aws:PrincipalArn: !Sub "arn:aws:iam::${AWS::AccountId}:role/service-role/aws-quicksight-s3-consumers-role-v0"
+            - !Ref "AWS::NoValue" # If not prod, no statement
+
+
+  # The gold bucket
+  GoldBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "fr-${Env}-${AWS::Region}-after-banking-gold"
+      LoggingConfiguration:
+        DestinationBucketName: !Ref CloudTrailBucketName
+        LogFilePrefix: !Sub "ACCESS-LOGS/fr-${Env}-${AWS::Region}-after-banking-gold-"
+      # Ensure the bucket is private
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+      # Enable the versioning
+      VersioningConfiguration:
+        Status: Enabled
+
+      # Enable the S3 Analytics
+      AnalyticsConfigurations:
+        - Id: DashboardAnalyticsConfig
+          StorageClassAnalysis: {}
+          Prefix: AnalyticsConfigurationPrefix
+
+      # Encrypt the objects with SSE-KMS key
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: "aws:kms"             # the objects will be encrypted with the SSE-KMS key managed by AWS
+              KMSMasterKeyID: "alias/aws/s3"
+            BucketKeyEnabled: true
+
+      # Lifecycle
+      LifecycleConfiguration:
+        Rules:
+          # Move the objects greater than 128 KB to the Intellignet Tiering Storage Class
+          - Id: MoveToIntelligentTieringAfter30Days
+            Status: Enabled
+            ObjectSizeGreaterThan: 131073 # bytes (this is the minimal allowed value) > 128 KB
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: INTELLIGENT_TIERING
+
+      NotificationConfiguration:
+        QueueConfigurations:
+          - Queue: !Sub 'arn:aws:sqs:${AWS::Region}:${AWS::AccountId}:fr-${Env}-${AWS::Region}-gold-sqs-queue'
+            Event: "s3:ObjectCreated:*"
+          - Queue: !Sub 'arn:aws:sqs:${AWS::Region}:${AWS::AccountId}:fr-${Env}-${AWS::Region}-gold-sqs-queue'
+            Event: "s3:ObjectRemoved:*"
+          - Queue: !Sub 'arn:aws:sqs:${AWS::Region}:${AWS::AccountId}:fr-${Env}-${AWS::Region}-gold-sqs-queue'
+            Event: "s3:ObjectTagging:*"
+
+  GoldBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref GoldBucket
+      PolicyDocument:
+        Statement:
+          # Only SSL requests are allowed
+          - Sid: AllowSSLRequestsOnly
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !GetAtt GoldBucket.Arn
+              - !Sub "${GoldBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+          # Grant Access to the Root Account
+          - Sid: AllowRootAccountAccess
+            Effect: Allow
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt GoldBucket.Arn
+              - !Sub "${GoldBucket.Arn}/*"
+            Condition:
+              StringEquals:
+                  aws:userId: !Sub ${AWS::AccountId}
+
+          # This statement is only applied in the 'test' environment.
+          - !If
+            - IsTest
+            # Grant Admin access to the given principals
+            - Sid: AllowAdminAccess
+              Effect: Allow
+              Principal: '*'
+              Action: 's3:*'
+              Resource:
+                - !GetAtt GoldBucket.Arn
+                - !Sub "${GoldBucket.Arn}/*"
+              Condition:
+                ArnEquals:
+                  aws:PrincipalArn:
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/aws-reserved/sso.amazonaws.com/eu-central-1/AWSReservedSSO_fr-prod-eu-central-1-admin_f4c13ac1ef030905"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/after-banking-${Service}-${Env}-CloudFormationExecutionRole"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:user/ludovic.lempereur"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:user/geoffray.menudier"
+            - !Ref "AWS::NoValue" # If not test, no statement
+
+          # Deny Access to all users except specified ones
+          # This statement is only applied in the 'test' environment.
+          - !If
+            - IsTest
+            - Sid: DenyAllButAllowedUser
+              Effect: Deny
+              Principal: '*'
+              Action: 's3:*'
+              Resource:
+                - !GetAtt GoldBucket.Arn
+                - !Sub "${GoldBucket.Arn}/*"
+              Condition:
+                StringNotEquals:
+                  aws:userId: !Sub ${AWS::AccountId}
+                ArnNotEquals:
+                  aws:PrincipalArn:
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/aws-reserved/sso.amazonaws.com/eu-central-1/AWSReservedSSO_fr_test_data_engineer_0cdf13deb99966bf"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/aws-reserved/sso.amazonaws.com/eu-central-1/AWSReservedSSO_fr-prod-eu-central-1-admin_f4c13ac1ef030905"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-gold-inventory-lambda-exec-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/after-banking-${Service}-${Env}-CloudFormationExecutionRole"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-glue-mig-iceberg-exec-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-migration-stepfunction-exec-main-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-restitution-stepfunction-exec-main-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-file-classification-lambda-exec-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-loancession-stepfunction-exec-main-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-loancession-stepfunction-exec-main-role-opt"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:user/ludovic.lempereur"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:user/geoffray.menudier"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-gold-scan-update-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-gold-sync-table-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-migration-stepfunction-exec-main-role-2"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-unload-partitioned-data-lambda-ex-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-purge-stepfunction-exec-main-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-afterbanking-promote-to-gold-sfn-exec-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-purge-client-doc-lambda-exec-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-afterbanking-promote-to-gold-lambda-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-afterbanking-purge-client-doc-sfn-exec-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-promote-rattrapage-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-extraction-doc-lambda-exec-role"
+
+            - !Ref "AWS::NoValue" # If not test, no statement
+
+          # Deny Access to all users except admin and specified ones
+          # This statement is only applied in the 'test' environment
+          - !If
+            - IsTest
+            - Sid: DenyWriteAllButAdminAndRootUsers
+              Effect: Deny
+              Principal: '*'
+              NotAction:
+                - s3:List*
+                - s3:Get*
+              Resource:
+                - !GetAtt GoldBucket.Arn
+                - !Sub "${GoldBucket.Arn}/*"
+              Condition:
+                StringNotEquals:
+                  aws:userId: !Sub ${AWS::AccountId}
+                ArnNotEquals:
+                  aws:PrincipalArn:
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/aws-reserved/sso.amazonaws.com/eu-central-1/AWSReservedSSO_fr-prod-eu-central-1-admin_f4c13ac1ef030905"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/after-banking-${Service}-${Env}-CloudFormationExecutionRole"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-glue-mig-iceberg-exec-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-migration-stepfunction-exec-main-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-restitution-stepfunction-exec-main-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-file-classification-lambda-exec-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-loancession-stepfunction-exec-main-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-loancession-stepfunction-exec-main-role-opt"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:user/ludovic.lempereur"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:user/geoffray.menudier"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-migration-stepfunction-exec-main-role-2"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-unload-partitioned-data-lambda-ex-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-purge-stepfunction-exec-main-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-purge-client-doc-lambda-exec-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-afterbanking-promote-to-gold-sfn-exec-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-afterbanking-promote-to-gold-lambda-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-afterbanking-purge-client-doc-sfn-exec-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-promote-rattrapage-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-extraction-doc-lambda-exec-role"
+
+            - !Ref "AWS::NoValue" # If not prod, no statement
+
+          # Deny policy for the Inventory Lambda
+          # This statement is only applied in the 'test' environment.
+          - !If
+            - IsTest
+            - Sid: DenyAllButLambdaInventoryRequired
+              Effect: Deny
+              Principal: '*'
+              NotAction:
+                - s3:GetObject
+                - s3:ListBucket
+                - s3:GetObjectACL
+                - s3:GetObjectTagging
+                - s3:ListBucketVersions
+              Resource:
+                - !GetAtt GoldBucket.Arn
+                - !Sub "${GoldBucket.Arn}/*"
+              Condition:
+                ArnEquals:
+                  aws:PrincipalArn: !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-gold-inventory-lambda-exec-role"
+            - !Ref "AWS::NoValue" # If not test, no statement
+
+          # This statement is only applied in the 'prod' environment.
+          - !If
+            - IsProd
+            # Grant Admin access to the given principals
+            - Sid: AllowAdminAccess
+              Effect: Allow
+              Principal: '*'
+              Action: 's3:*'
+              Resource:
+                - !GetAtt GoldBucket.Arn
+                - !Sub "${GoldBucket.Arn}/*"
+              Condition:
+                ArnEquals:
+                  aws:PrincipalArn:
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/aws-reserved/sso.amazonaws.com/eu-central-1/AWSReservedSSO_fr-prod-eu-central-1-admin_f4c13ac1ef030905"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/after-banking-${Service}-${Env}-CloudFormationExecutionRole"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:user/ludovic.lempereur"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:user/geoffray.menudier"
+            - !Ref "AWS::NoValue" # If not prod, no statement
+
+          # Deny Access to all users except specified ones
+          # This statement is only applied in the 'prod' environment.
+          - !If
+            - IsProd
+            - Sid: DenyAllButAllowedUser
+              Effect: Deny
+              Principal: '*'
+              Action: 's3:*'
+              Resource:
+                - !GetAtt GoldBucket.Arn
+                - !Sub "${GoldBucket.Arn}/*"
+              Condition:
+                StringNotEquals:
+                  aws:userId: !Sub ${AWS::AccountId}
+                ArnNotEquals:
+                  aws:PrincipalArn:
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:role/aws-reserved/sso.amazonaws.com/eu-central-1/AWSReservedSSO_fr-prod-eu-central-1-admin_f4c13ac1ef030905"
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:role/aws-reserved/sso.amazonaws.com/eu-central-1/AWSReservedSSO_fr_prod_data_engineer_cc3919e7405e2c99"
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:role/aws-reserved/sso.amazonaws.com/eu-central-1/AWSReservedSSO_fr_prod_data_analyst_15ed2db26f45ffbc"
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-gold-inventory-lambda-exec-role"
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:role/after-banking-${Service}-${Env}-CloudFormationExecutionRole"
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-glue-mig-iceberg-exec-role"
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-migration-stepfunction-exec-main-role"
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-restitution-stepfunction-exec-main-role"
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-file-classification-lambda-exec-role"
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-loancession-stepfunction-exec-main-role"
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-loancession-stepfunction-exec-main-role-opt"
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:user/ludovic.lempereur"
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:user/geoffray.menudier"
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-gold-scan-update-role"
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-gold-sync-table-role"
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-migration-stepfunction-exec-main-role-2"
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-unload-partitioned-data-lambda-ex-role"
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-purge-stepfunction-exec-main-role"
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-afterbanking-promote-to-gold-sfn-exec-role"
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-purge-client-doc-lambda-exec-role"
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-afterbanking-promote-to-gold-lambda-role"
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-afterbanking-purge-client-doc-sfn-exec-role"
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-promote-rattrapage-role"
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-extraction-doc-lambda-exec-role"
+            - !Ref "AWS::NoValue" # If not prod, no statement
+
+          # Deny Access to all users except admin and specified ones
+          # This statement is only applied in the 'prod' environment
+          - !If
+            - IsProd
+            - Sid: DenyWriteAllButAdminAndRootUsers
+              Effect: Deny
+              Principal: '*'
+              NotAction:
+                - s3:List*
+                - s3:Get*
+              Resource:
+                - !GetAtt GoldBucket.Arn
+                - !Sub "${GoldBucket.Arn}/*"
+              Condition:
+                StringNotEquals:
+                  aws:userId: !Sub ${AWS::AccountId}
+                ArnNotEquals:
+                  aws:PrincipalArn:
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/aws-reserved/sso.amazonaws.com/eu-central-1/AWSReservedSSO_fr-prod-eu-central-1-admin_f4c13ac1ef030905"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/after-banking-${Service}-${Env}-CloudFormationExecutionRole"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-glue-mig-iceberg-exec-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-migration-stepfunction-exec-main-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-restitution-stepfunction-exec-main-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-file-classification-lambda-exec-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-loancession-stepfunction-exec-main-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-loancession-stepfunction-exec-main-role-opt"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:user/ludovic.lempereur"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:user/geoffray.menudier"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-migration-stepfunction-exec-main-role-2"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-unload-partitioned-data-lambda-ex-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-purge-stepfunction-exec-main-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-purge-client-doc-lambda-exec-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-afterbanking-promote-to-gold-sfn-exec-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-afterbanking-promote-to-gold-lambda-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-afterbanking-purge-client-doc-sfn-exec-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-promote-rattrapage-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-extraction-doc-lambda-exec-role"
+            - !Ref "AWS::NoValue" # If not prod, no statement
+
+          # Deny policy for the Inventory Lambda
+          # This statement is only applied in the 'prod' environment.
+          - !If
+            - IsProd
+            - Sid: DenyAllButLambdaInventoryRequired
+              Effect: Deny
+              Principal: '*'
+              NotAction:
+                - s3:GetObject
+                - s3:ListBucket
+                - s3:GetObjectACL
+                - s3:GetObjectTagging
+                - s3:ListBucketVersions
+              Resource:
+                - !GetAtt GoldBucket.Arn
+                - !Sub "${GoldBucket.Arn}/*"
+              Condition:
+                ArnEquals:
+                  aws:PrincipalArn: !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-gold-inventory-lambda-exec-role"
+            - !Ref "AWS::NoValue" # If not prod, no statement
+
+          # Deny Policy for Get/Put actions
+          # This statement is only applied in the 'prod' environment
+          - !If
+            - IsProd
+            - Sid: BlockAthenaDownloads
+              Effect: Deny
+              Principal: '*'
+              Action:
+                - s3:GetObject
+                - s3:PutObject
+              Resource:
+                - !GetAtt GoldBucket.Arn
+                - !Sub "${GoldBucket.Arn}/*"
+              Condition:
+                StringNotEquals:
+                  aws:calledViaLast: athena.amazonaws.com
+                ArnEquals:
+                  aws:PrincipalArn:
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/aws-reserved/sso.amazonaws.com/eu-central-1/AWSReservedSSO_fr_prod_data_engineer_cc3919e7405e2c99"
+            - !Ref "AWS::NoValue" # If not prod, no statement
+  # The gold bucket governance
+  GoldBucketGovernance:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "fr-${Env}-${AWS::Region}-after-banking-gold-governance"
+      LoggingConfiguration:
+        DestinationBucketName: !Ref CloudTrailBucketName
+        LogFilePrefix: !Sub "ACCESS-LOGS/fr-${Env}-${AWS::Region}-after-banking-gold-governance-"
+      # Ensure the bucket is private
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+      # Enable the versioning
+      VersioningConfiguration:
+        Status: Enabled
+
+      # Enable the S3 Analytics
+      AnalyticsConfigurations:
+        - Id: DashboardAnalyticsConfig
+          StorageClassAnalysis: {}
+          Prefix: AnalyticsConfigurationPrefix
+
+      # Encrypt the objects with SSE-KMS key
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: "aws:kms"             # the objects will be encrypted with the SSE-KMS key managed by AWS
+              KMSMasterKeyID: "alias/aws/s3"
+            BucketKeyEnabled: true
+
+      # Lifecycle
+      LifecycleConfiguration:
+        Rules:
+          # Move the objects greater than 128 KB to the Intellignet Tiering Storage Class
+          - Id: MoveToIntelligentTieringAfter30Days
+            Status: Enabled
+            ObjectSizeGreaterThan: 131073 # bytes (this is the minimal allowed value) > 128 KB
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: INTELLIGENT_TIERING
+
+  GoldBucketGovernancePolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref GoldBucketGovernance
+      PolicyDocument:
+        Statement:
+          # Only SSL requests are allowed
+          - Sid: AllowSSLRequestsOnly
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !GetAtt GoldBucketGovernance.Arn
+              - !Sub "${GoldBucketGovernance.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+          # Grant Access to the Root Account
+          - Sid: AllowRootAccountAccess
+            Effect: Allow
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt GoldBucketGovernance.Arn
+              - !Sub "${GoldBucketGovernance.Arn}/*"
+            Condition:
+              StringEquals:
+                  aws:userId: !Sub ${AWS::AccountId}
+
+          # This statement is only applied in the 'test' environment.
+          - !If
+            - IsTest
+            # Grant Admin access to the given principals
+            - Sid: AllowAdminAccess
+              Effect: Allow
+              Principal: '*'
+              Action: 's3:*'
+              Resource:
+                - !GetAtt GoldBucketGovernance.Arn
+                - !Sub "${GoldBucketGovernance.Arn}/*"
+              Condition:
+                ArnEquals:
+                  aws:PrincipalArn:
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/aws-reserved/sso.amazonaws.com/eu-central-1/AWSReservedSSO_fr-prod-eu-central-1-admin_f4c13ac1ef030905"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/after-banking-${Service}-${Env}-CloudFormationExecutionRole"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:user/ludovic.lempereur"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:user/geoffray.menudier"
+            - !Ref "AWS::NoValue" # If not test, no statement
+
+          # Deny Access to all users except specified ones
+          # This statement is only applied in the 'test' environment.
+          - !If
+            - IsTest
+            - Sid: DenyAllButAllowedUser
+              Effect: Deny
+              Principal: '*'
+              Action: 's3:*'
+              Resource:
+                - !GetAtt GoldBucketGovernance.Arn
+                - !Sub "${GoldBucketGovernance.Arn}/*"
+              Condition:
+                StringNotEquals:
+                  aws:userId: !Sub ${AWS::AccountId}
+                ArnNotEquals:
+                  aws:PrincipalArn:
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/aws-reserved/sso.amazonaws.com/eu-central-1/AWSReservedSSO_fr_test_data_engineer_0cdf13deb99966bf"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/aws-reserved/sso.amazonaws.com/eu-central-1/AWSReservedSSO_fr-prod-eu-central-1-admin_f4c13ac1ef030905"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/after-banking-${Service}-${Env}-CloudFormationExecutionRole"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:user/ludovic.lempereur"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:user/geoffray.menudier"
+            - !Ref "AWS::NoValue" # If not test, no statement
+
+          # Deny Access to all users except admin and specified ones
+          # This statement is only applied in the 'test' environment
+          - !If
+            - IsTest
+            - Sid: DenyWriteAllButAdminAndRootUsers
+              Effect: Deny
+              Principal: '*'
+              NotAction:
+                - s3:List*
+                - s3:Get*
+              Resource:
+                - !GetAtt GoldBucketGovernance.Arn
+                - !Sub "${GoldBucketGovernance.Arn}/*"
+              Condition:
+                StringNotEquals:
+                  aws:userId: !Sub ${AWS::AccountId}
+                ArnNotEquals:
+                  aws:PrincipalArn:
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/aws-reserved/sso.amazonaws.com/eu-central-1/AWSReservedSSO_fr-prod-eu-central-1-admin_f4c13ac1ef030905"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/after-banking-${Service}-${Env}-CloudFormationExecutionRole"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:user/ludovic.lempereur"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:user/geoffray.menudier"
+            - !Ref "AWS::NoValue" # If not prod, no statement
+
+          # Deny Access to all users except specified ones
+          # This statement is only applied in the 'prod' environment.
+          - !If
+            - IsProd
+            - Sid: DenyAllButAllowedUser
+              Effect: Deny
+              Principal: '*'
+              Action: 's3:*'
+              Resource:
+                - !GetAtt GoldBucketGovernance.Arn
+                - !Sub "${GoldBucketGovernance.Arn}/*"
+              Condition:
+                StringNotEquals:
+                  aws:userId: !Sub ${AWS::AccountId}
+                ArnNotEquals:
+                  aws:PrincipalArn:
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:role/aws-reserved/sso.amazonaws.com/eu-central-1/AWSReservedSSO_fr-prod-eu-central-1-admin_f4c13ac1ef030905"
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:role/aws-reserved/sso.amazonaws.com/eu-central-1/AWSReservedSSO_fr_prod_data_engineer_cc3919e7405e2c99"
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:role/after-banking-${Service}-${Env}-CloudFormationExecutionRole"
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:user/ludovic.lempereur"
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:user/geoffray.menudier"
+            - !Ref "AWS::NoValue" # If not prod, no statement
+
+          # Deny Access to all users except admin and specified ones
+          # This statement is only applied in the 'prod' environment
+          - !If
+            - IsProd
+            - Sid: DenyWriteAllButAdminAndRootUsers
+              Effect: Deny
+              Principal: '*'
+              NotAction:
+                - s3:List*
+                - s3:Get*
+              Resource:
+                - !GetAtt GoldBucketGovernance.Arn
+                - !Sub "${GoldBucketGovernance.Arn}/*"
+              Condition:
+                StringNotEquals:
+                  aws:userId: !Sub ${AWS::AccountId}
+                ArnNotEquals:
+                  aws:PrincipalArn:
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/aws-reserved/sso.amazonaws.com/eu-central-1/AWSReservedSSO_fr-prod-eu-central-1-admin_f4c13ac1ef030905"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/after-banking-${Service}-${Env}-CloudFormationExecutionRole"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:user/ludovic.lempereur"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:user/geoffray.menudier"
+            - !Ref "AWS::NoValue" # If not prod, no statement
+
+  # The bucket with the data of the old employees
+  KnowledgeBaseBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "fr-${Env}-${AWS::Region}-after-banking-knowledge-base"
+      LoggingConfiguration:
+        DestinationBucketName: !Ref CloudTrailBucketName
+        LogFilePrefix: !Sub "ACCESS-LOGS/fr-${Env}-${AWS::Region}-after-banking-knowledge-base-"
+      # Ensure the bucket is private
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+      # Enable the versioning
+      VersioningConfiguration:
+        Status: Enabled
+
+      # Enable the S3 Analytics
+      AnalyticsConfigurations:
+        - Id: DashboardAnalyticsConfig
+          StorageClassAnalysis: {}
+          Prefix: AnalyticsConfigurationPrefix
+
+      # Encrypt the objects with SSE-KMS key
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: "aws:kms"             # the objects will be encrypted with the SSE-KMS key managed by AWS
+              KMSMasterKeyID: "alias/aws/s3"
+            BucketKeyEnabled: true
+
+      # Lifecycle
+      LifecycleConfiguration:
+        Rules:
+          # Move the objects greater than 128 KB to the Intellignet Tiering Storage Class
+          - Id: MoveToIntelligentTieringAfter30Days
+            Status: Enabled
+            ObjectSizeGreaterThan: 131073 # bytes (this is the minimal allowed value) > 128 KB
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: INTELLIGENT_TIERING
+
+
+  KnowledgeBaseBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref KnowledgeBaseBucket
+      PolicyDocument:
+        Statement:
+          # Only SSL requests are allowed
+          - Sid: AllowSSLRequestsOnly
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !GetAtt KnowledgeBaseBucket.Arn
+              - !Sub "${KnowledgeBaseBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+          # Grant Access to the Root Account
+          - Sid: AllowRootAccountAccess
+            Effect: Allow
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt KnowledgeBaseBucket.Arn
+              - !Sub "${KnowledgeBaseBucket.Arn}/*"
+            Condition:
+                StringEquals:
+                    aws:userId: !Sub ${AWS::AccountId}
+
+          # This statement is only applied in the 'test' environment.
+          - !If
+            - IsTest
+            # Grant Admin access to the given principals
+            - Sid: AllowAdminAccess
+              Effect: Allow
+              Principal: '*'
+              Action: 's3:*'
+              Resource:
+                - !GetAtt KnowledgeBaseBucket.Arn
+                - !Sub "${KnowledgeBaseBucket.Arn}/*"
+              Condition:
+                ArnEquals:
+                  aws:PrincipalArn:
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/aws-reserved/sso.amazonaws.com/eu-central-1/AWSReservedSSO_fr-prod-eu-central-1-admin_f4c13ac1ef030905"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/after-banking-${Service}-${Env}-CloudFormationExecutionRole"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:user/ludovic.lempereur"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:user/geoffray.menudier"
+            - !Ref "AWS::NoValue" # If not test, no statement
+
+          # Deny Access to all users except specified ones
+          # This statement is only applied in the 'test' environment.
+          - !If
+            - IsTest
+            - Sid: DenyAllButAllowedUser
+              Effect: Deny
+              Principal: '*'
+              Action: 's3:*'
+              Resource:
+                - !GetAtt KnowledgeBaseBucket.Arn
+                - !Sub "${KnowledgeBaseBucket.Arn}/*"
+              Condition:
+                StringNotEquals:
+                  aws:userId: !Sub ${AWS::AccountId}
+                ArnNotEquals:
+                  aws:PrincipalArn:
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/aws-reserved/sso.amazonaws.com/eu-central-1/AWSReservedSSO_fr_test_data_engineer_0cdf13deb99966bf"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/aws-reserved/sso.amazonaws.com/eu-central-1/AWSReservedSSO_fr-prod-eu-central-1-admin_f4c13ac1ef030905"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/after-banking-${Service}-${Env}-CloudFormationExecutionRole"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:user/ludovic.lempereur"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:user/geoffray.menudier"
+            - !Ref "AWS::NoValue" # If not test, no statement
+
+          # Deny Access to all users except admin and specified ones
+          # This statement is only applied in the 'test' environment
+          - !If
+            - IsTest
+            - Sid: DenyWriteAllButAdminAndRootUsers
+              Effect: Deny
+              Principal: '*'
+              NotAction:
+                - s3:List*
+                - s3:Get*
+              Resource:
+                - !GetAtt KnowledgeBaseBucket.Arn
+                - !Sub "${KnowledgeBaseBucket.Arn}/*"
+              Condition:
+                StringNotEquals:
+                  aws:userId: !Sub ${AWS::AccountId}
+                ArnNotEquals:
+                  aws:PrincipalArn:
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/aws-reserved/sso.amazonaws.com/eu-central-1/AWSReservedSSO_fr-prod-eu-central-1-admin_f4c13ac1ef030905"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/after-banking-${Service}-${Env}-CloudFormationExecutionRole"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:user/ludovic.lempereur"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:user/geoffray.menudier"
+            - !Ref "AWS::NoValue" # If not prod, no statement
+
+          # This statement is only applied in the 'prod' environment.
+          - !If
+            - IsProd
+            # Grant Admin access to the given principals
+            - Sid: AllowAdminAccess
+              Effect: Allow
+              Principal: '*'
+              Action: 's3:*'
+              Resource:
+                - !GetAtt KnowledgeBaseBucket.Arn
+                - !Sub "${KnowledgeBaseBucket.Arn}/*"
+              Condition:
+                ArnEquals:
+                  aws:PrincipalArn:
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/aws-reserved/sso.amazonaws.com/eu-central-1/AWSReservedSSO_fr-prod-eu-central-1-admin_f4c13ac1ef030905"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/after-banking-${Service}-${Env}-CloudFormationExecutionRole"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:user/ludovic.lempereur"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:user/geoffray.menudier"
+            - !Ref "AWS::NoValue" # If not prod, no statement
+
+          # Deny Access to all users except specified ones
+          # This statement is only applied in the 'prod' environment.
+          - !If
+            - IsProd
+            - Sid: DenyAllButAllowedUser
+              Effect: Deny
+              Principal: '*'
+              Action: 's3:*'
+              Resource:
+                - !GetAtt KnowledgeBaseBucket.Arn
+                - !Sub "${KnowledgeBaseBucket.Arn}/*"
+              Condition:
+                StringNotEquals:
+                  aws:userId: !Sub ${AWS::AccountId}
+                ArnNotEquals:
+                  aws:PrincipalArn:
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/aws-reserved/sso.amazonaws.com/eu-central-1/AWSReservedSSO_fr-prod-eu-central-1-admin_f4c13ac1ef030905"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/aws-reserved/sso.amazonaws.com/eu-central-1/AWSReservedSSO_fr_prod_data_engineer_cc3919e7405e2c99"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/after-banking-${Service}-${Env}-CloudFormationExecutionRole"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:user/ludovic.lempereur"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:user/geoffray.menudier"
+            - !Ref "AWS::NoValue" # If not prod, no statement
+
+          # Deny Access to all users except admin and specified ones
+          # This statement is only applied in the 'prod' environment
+          - !If
+            - IsProd
+            - Sid: DenyWriteAllButAdminAndRootUsers
+              Effect: Deny
+              Principal: '*'
+              NotAction:
+                - s3:List*
+                - s3:Get*
+              Resource:
+                - !GetAtt KnowledgeBaseBucket.Arn
+                - !Sub "${KnowledgeBaseBucket.Arn}/*"
+              Condition:
+                StringNotEquals:
+                  aws:userId: !Sub ${AWS::AccountId}
+                ArnNotEquals:
+                  aws:PrincipalArn:
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/aws-reserved/sso.amazonaws.com/eu-central-1/AWSReservedSSO_fr-prod-eu-central-1-admin_f4c13ac1ef030905"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/after-banking-${Service}-${Env}-CloudFormationExecutionRole"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:user/ludovic.lempereur"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:user/geoffray.menudier"
+            - !Ref "AWS::NoValue" # If not prod, no statement
+
+  # The bucket with the data of the company
+  CorporateBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "fr-${Env}-${AWS::Region}-after-banking-corporate"
+      LoggingConfiguration:
+        DestinationBucketName: !Ref CloudTrailBucketName
+        LogFilePrefix: !Sub "ACCESS-LOGS/fr-${Env}-${AWS::Region}-after-banking-corporate-"
+      # Ensure the bucket is private
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+      # Enable the versioning
+      VersioningConfiguration:
+        Status: Enabled
+
+      # Enable the S3 Analytics
+      AnalyticsConfigurations:
+        - Id: DashboardAnalyticsConfig
+          StorageClassAnalysis: {}
+          Prefix: AnalyticsConfigurationPrefix
+
+      # Encrypt the objects with SSE-KMS key
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: "aws:kms"             # the objects will be encrypted with the SSE-KMS key managed by AWS
+              KMSMasterKeyID: "alias/aws/s3"
+            BucketKeyEnabled: true
+
+      # Lifecycle
+      LifecycleConfiguration:
+        Rules:
+          # Move the objects greater than 128 KB to the Intellignet Tiering Storage Class
+          - Id: MoveToIntelligentTieringAfter30Days
+            Status: Enabled
+            ObjectSizeGreaterThan: 131073 # bytes (this is the minimal allowed value) > 128 KB
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: INTELLIGENT_TIERING
+
+      NotificationConfiguration:
+        QueueConfigurations:
+          - Queue: !Sub 'arn:aws:sqs:${AWS::Region}:${AWS::AccountId}:fr-${Env}-${AWS::Region}-gold-sqs-queue'
+            Event: "s3:ObjectCreated:*"
+          - Queue: !Sub 'arn:aws:sqs:${AWS::Region}:${AWS::AccountId}:fr-${Env}-${AWS::Region}-gold-sqs-queue'
+            Event: "s3:ObjectRemoved:*"
+          - Queue: !Sub 'arn:aws:sqs:${AWS::Region}:${AWS::AccountId}:fr-${Env}-${AWS::Region}-gold-sqs-queue'
+            Event: "s3:ObjectTagging:*"
+
+  CorporateBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref CorporateBucket
+      PolicyDocument:
+        Statement:
+          # Only SSL requests are allowed
+          - Sid: AllowSSLRequestsOnly
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !GetAtt CorporateBucket.Arn
+              - !Sub "${CorporateBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+          # Grant Access to the Root Account
+          - Sid: AllowRootAccountAccess
+            Effect: Allow
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt CorporateBucket.Arn
+              - !Sub "${CorporateBucket.Arn}/*"
+            Condition:
+              StringEquals:
+                  aws:userId: !Sub ${AWS::AccountId}
+
+          # This statement is only applied in the 'test' environment.
+          - !If
+            - IsTest
+            # Grant Admin access to the given principals
+            - Sid: AllowAdminAccess
+              Effect: Allow
+              Principal: '*'
+              Action: 's3:*'
+              Resource:
+                - !GetAtt CorporateBucket.Arn
+                - !Sub "${CorporateBucket.Arn}/*"
+              Condition:
+                ArnEquals:
+                  aws:PrincipalArn:
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/aws-reserved/sso.amazonaws.com/eu-central-1/AWSReservedSSO_fr-prod-eu-central-1-admin_f4c13ac1ef030905"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/after-banking-${Service}-${Env}-CloudFormationExecutionRole"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:user/ludovic.lempereur"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:user/geoffray.menudier"
+            - !Ref "AWS::NoValue" # If not test, no statement
+
+          # Deny Access to all users except specified ones
+          # This statement is only applied in the 'test' environment.
+          - !If
+            - IsTest
+            - Sid: DenyAllButAllowedUser
+              Effect: Deny
+              Principal: '*'
+              Action: 's3:*'
+              Resource:
+                - !GetAtt CorporateBucket.Arn
+                - !Sub "${CorporateBucket.Arn}/*"
+              Condition:
+                StringNotEquals:
+                  aws:userId: !Sub ${AWS::AccountId}
+                ArnNotEquals:
+                  aws:PrincipalArn:
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/aws-reserved/sso.amazonaws.com/eu-central-1/AWSReservedSSO_fr_test_data_engineer_0cdf13deb99966bf"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/aws-reserved/sso.amazonaws.com/eu-central-1/AWSReservedSSO_fr-prod-eu-central-1-admin_f4c13ac1ef030905"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-gold-inventory-lambda-exec-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/after-banking-${Service}-${Env}-CloudFormationExecutionRole"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-nonstructured-raw-int-to-corporate-exe-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-gold-scan-update-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-gold-sync-table-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-purge-stepfunction-exec-main-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:user/ludovic.lempereur"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:user/geoffray.menudier"
+            - !Ref "AWS::NoValue" # If not test, no statement
+
+          # Deny Access to all users except admin and specified ones
+          # This statement is only applied in the 'test' environment
+          - !If
+            - IsTest
+            - Sid: DenyWriteAllButAdminAndRootUsers
+              Effect: Deny
+              Principal: '*'
+              NotAction:
+                - s3:List*
+                - s3:Get*
+              Resource:
+                - !GetAtt CorporateBucket.Arn
+                - !Sub "${CorporateBucket.Arn}/*"
+              Condition:
+                StringNotEquals:
+                  aws:userId: !Sub ${AWS::AccountId}
+                ArnNotEquals:
+                  aws:PrincipalArn:
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/aws-reserved/sso.amazonaws.com/eu-central-1/AWSReservedSSO_fr-prod-eu-central-1-admin_f4c13ac1ef030905"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/after-banking-${Service}-${Env}-CloudFormationExecutionRole"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-nonstructured-raw-int-to-corporate-exe-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-purge-stepfunction-exec-main-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:user/ludovic.lempereur"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:user/geoffray.menudier"
+            - !Ref "AWS::NoValue" # If not prod, no statement
+
+          # Deny policy for the Inventory Lambda
+          # This statement is only applied in the 'test' environment.
+          - !If
+            - IsTest
+            - Sid: DenyAllButLambdaInventoryRequired
+              Effect: Deny
+              Principal: '*'
+              NotAction:
+                - s3:GetObject
+                - s3:ListBucket
+                - s3:GetObjectACL
+                - s3:GetObjectTagging
+                - s3:ListBucketVersions
+              Resource:
+                - !GetAtt CorporateBucket.Arn
+                - !Sub "${CorporateBucket.Arn}/*"
+              Condition:
+                ArnEquals:
+                  aws:PrincipalArn: !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-gold-inventory-lambda-exec-role"
+            - !Ref "AWS::NoValue" # If not test, no statement
+
+          # This statement is only applied in the 'prod' environment.
+          - !If
+            - IsProd
+            # Grant Admin access to the given principals
+            - Sid: AllowAdminAccess
+              Effect: Allow
+              Principal: '*'
+              Action: 's3:*'
+              Resource:
+                - !GetAtt CorporateBucket.Arn
+                - !Sub "${CorporateBucket.Arn}/*"
+              Condition:
+                ArnEquals:
+                  aws:PrincipalArn:
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/aws-reserved/sso.amazonaws.com/eu-central-1/AWSReservedSSO_fr-prod-eu-central-1-admin_f4c13ac1ef030905"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/after-banking-${Service}-${Env}-CloudFormationExecutionRole"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:user/ludovic.lempereur"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:user/geoffray.menudier"
+            - !Ref "AWS::NoValue" # If not prod, no statement
+
+          # Deny Access to all users except specified ones
+          # This statement is only applied in the 'prod' environment.
+          - !If
+            - IsProd
+            - Sid: DenyAllButAllowedUser
+              Effect: Deny
+              Principal: '*'
+              Action: 's3:*'
+              Resource:
+                - !GetAtt CorporateBucket.Arn
+                - !Sub "${CorporateBucket.Arn}/*"
+              Condition:
+                StringNotEquals:
+                  aws:userId: !Sub ${AWS::AccountId}
+                ArnNotEquals:
+                  aws:PrincipalArn:
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/aws-reserved/sso.amazonaws.com/eu-central-1/AWSReservedSSO_fr-prod-eu-central-1-admin_f4c13ac1ef030905"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/aws-reserved/sso.amazonaws.com/eu-central-1/AWSReservedSSO_fr_prod_data_engineer_cc3919e7405e2c99"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/aws-reserved/sso.amazonaws.com/eu-central-1/AWSReservedSSO_fr_prod_expertbanque_99aca09d9c59133c"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-gold-inventory-lambda-exec-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/after-banking-${Service}-${Env}-CloudFormationExecutionRole"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-nonstructured-raw-int-to-corporate-exe-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-gold-scan-update-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-gold-sync-table-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:user/ludovic.lempereur"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:user/geoffray.menudier"
+            - !Ref "AWS::NoValue" # If not prod, no statement
+
+          # Deny Access to all users except admin and specified ones
+          # This statement is only applied in the 'prod' environment
+          - !If
+            - IsProd
+            - Sid: DenyWriteAllButAdminAndRootUsers
+              Effect: Deny
+              Principal: '*'
+              NotAction:
+                - s3:List*
+                - s3:Get*
+              Resource:
+                - !GetAtt CorporateBucket.Arn
+                - !Sub "${CorporateBucket.Arn}/*"
+              Condition:
+                StringNotEquals:
+                  aws:userId: !Sub ${AWS::AccountId}
+                ArnNotEquals:
+                  aws:PrincipalArn:
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/aws-reserved/sso.amazonaws.com/eu-central-1/AWSReservedSSO_fr-prod-eu-central-1-admin_f4c13ac1ef030905"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/after-banking-${Service}-${Env}-CloudFormationExecutionRole"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-nonstructured-raw-int-to-corporate-exe-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:user/ludovic.lempereur"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:user/geoffray.menudier"
+            - !Ref "AWS::NoValue" # If not prod, no statement
+
+          # Deny policy for the Inventory Lambda
+          # This statement is only applied in the 'test' environment.
+          - !If
+            - IsProd
+            - Sid: DenyAllButLambdaInventoryRequired
+              Effect: Deny
+              Principal: '*'
+              NotAction:
+                - s3:GetObject
+                - s3:ListBucket
+                - s3:GetObjectACL
+                - s3:GetObjectTagging
+                - s3:ListBucketVersions
+              Resource:
+                - !GetAtt CorporateBucket.Arn
+                - !Sub "${CorporateBucket.Arn}/*"
+              Condition:
+                ArnEquals:
+                  aws:PrincipalArn: !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-gold-inventory-lambda-exec-role"
+            - !Ref "AWS::NoValue" # If not test, no statement
+
+  # The bucket with the results produced by the AWS StepFunctions
+  RestitutionBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "fr-${Env}-${AWS::Region}-after-banking-restitution"
+      LoggingConfiguration:
+        DestinationBucketName: !Ref CloudTrailBucketName
+        LogFilePrefix: !Sub "ACCESS-LOGS/fr-${Env}-${AWS::Region}-after-banking-restitution-"
+      # Ensure the bucket is private
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+      # Enable the versioning
+      VersioningConfiguration:
+        Status: Enabled
+
+      # Enable the S3 Analytics
+      AnalyticsConfigurations:
+        - Id: DashboardAnalyticsConfig
+          StorageClassAnalysis: {}
+          Prefix: AnalyticsConfigurationPrefix
+
+      # Encrypt the objects with SSE-KMS key
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: "aws:kms"             # the objects will be encrypted with the SSE-KMS key managed by AWS
+              KMSMasterKeyID: "alias/aws/s3"
+            BucketKeyEnabled: true
+
+      # Lifecycle
+      LifecycleConfiguration:
+        Rules:
+          # Move the objects greater than 128 KB to the Intellignet Tiering Storage Class
+          - Id: MoveToIntelligentTieringAfter30Days
+            Status: Enabled
+            ObjectSizeGreaterThan: 131073 # bytes (this is the minimal allowed value) > 128 KB
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: INTELLIGENT_TIERING
+
+          - Id: PurgeObjectsAfter30Days
+            Status: Enabled
+            Prefix: ""
+            ExpirationInDays: 30
+            NoncurrentVersionExpirationInDays: 30
+
+          - Id: DeleteAthenaQueryResultsAfter07Days
+            Prefix: "athena_query_results/"
+            Status: Enabled
+            ExpirationInDays: 7
+            NoncurrentVersionExpirationInDays: 7
+
+          - Id: DeleteTempFoldersAfter07Days
+            Prefix: "temp_folders/"
+            Status: Enabled
+            ExpirationInDays: 7
+            NoncurrentVersionExpirationInDays: 7
+
+  RestitutionBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref RestitutionBucket
+      PolicyDocument:
+        Statement:
+          # Only SSL requests are allowed
+          - Sid: AllowSSLRequestsOnly
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !GetAtt RestitutionBucket.Arn
+              - !Sub "${RestitutionBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+          # Grant Access to the Root Account
+          - Sid: AllowRootAccountAccess
+            Effect: Allow
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt RestitutionBucket.Arn
+              - !Sub "${RestitutionBucket.Arn}/*"
+            Condition:
+              StringEquals:
+                  aws:userId: !Sub ${AWS::AccountId}
+
+          # This statement is only applied in the 'test' environment.
+          - !If
+            - IsTest
+            # Grant Admin access to the given principals
+            - Sid: AllowAdminAccess
+              Effect: Allow
+              Principal: '*'
+              Action: 's3:*'
+              Resource:
+                - !GetAtt RestitutionBucket.Arn
+                - !Sub "${RestitutionBucket.Arn}/*"
+              Condition:
+                ArnEquals:
+                  aws:PrincipalArn:
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/aws-reserved/sso.amazonaws.com/eu-central-1/AWSReservedSSO_fr-prod-eu-central-1-admin_f4c13ac1ef030905"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/after-banking-${Service}-${Env}-CloudFormationExecutionRole"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:user/ludovic.lempereur"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:user/geoffray.menudier"
+            - !Ref "AWS::NoValue" # If not test, no statement
+
+          # Deny Access to all users except specified ones
+          # This statement is only applied in the 'test' environment.
+          - !If
+            - IsTest
+            - Sid: DenyAllButAllowedUser
+              Effect: Deny
+              Principal: '*'
+              Action: 's3:*'
+              Resource:
+                - !GetAtt RestitutionBucket.Arn
+                - !Sub "${RestitutionBucket.Arn}/*"
+              Condition:
+                StringNotEquals:
+                  aws:userId: !Sub ${AWS::AccountId}
+                ArnNotEquals:
+                  aws:PrincipalArn:
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/aws-reserved/sso.amazonaws.com/eu-central-1/AWSReservedSSO_fr_test_data_engineer_0cdf13deb99966bf"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/aws-reserved/sso.amazonaws.com/eu-central-1/AWSReservedSSO_fr-prod-eu-central-1-admin_f4c13ac1ef030905"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/after-banking-${Service}-${Env}-CloudFormationExecutionRole"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:user/ludovic.lempereur"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:user/geoffray.menudier"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-zip-lambda-exec-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-restitution-stepfunction-exec-main-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-extraction-parquet-to-flat-lambda-exec-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-common-extraction-parquet-to-flat-lambda-exec-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-unload-partitioned-data-lambda-ex-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-scenario-extractions-lambda-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-extraction-doc-lambda-exec-role"
+            - !Ref "AWS::NoValue" # If not test, no statement
+
+          # Deny Access to all users except admin and specified ones
+          # This statement is only applied in the 'test' environment
+          - !If
+            - IsTest
+            - Sid: DenyWriteAllButAdminAndRootUsers
+              Effect: Deny
+              Principal: '*'
+              NotAction:
+                - s3:List*
+                - s3:Get*
+              Resource:
+                - !GetAtt RestitutionBucket.Arn
+                - !Sub "${RestitutionBucket.Arn}/*"
+              Condition:
+                StringNotEquals:
+                  aws:userId: !Sub ${AWS::AccountId}
+                ArnNotEquals:
+                  aws:PrincipalArn:
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/aws-reserved/sso.amazonaws.com/eu-central-1/AWSReservedSSO_fr-prod-eu-central-1-admin_f4c13ac1ef030905"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/after-banking-${Service}-${Env}-CloudFormationExecutionRole"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:user/ludovic.lempereur"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:user/geoffray.menudier"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-zip-lambda-exec-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-restitution-stepfunction-exec-main-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-extraction-parquet-to-flat-lambda-exec-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-common-extraction-parquet-to-flat-lambda-exec-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-unload-partitioned-data-lambda-ex-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-scenario-extractions-lambda-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-extraction-doc-lambda-exec-role"
+            - !Ref "AWS::NoValue" # If not prod, no statement
+
+          # This statement is only applied in the 'prod' environment.
+          - !If
+            - IsProd
+            # Grant Admin access to the given principals
+            - Sid: AllowAdminAccess
+              Effect: Allow
+              Principal: '*'
+              Action: 's3:*'
+              Resource:
+                - !GetAtt RestitutionBucket.Arn
+                - !Sub "${RestitutionBucket.Arn}/*"
+              Condition:
+                ArnEquals:
+                  aws:PrincipalArn:
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/aws-reserved/sso.amazonaws.com/eu-central-1/AWSReservedSSO_fr-prod-eu-central-1-admin_f4c13ac1ef030905"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/after-banking-${Service}-${Env}-CloudFormationExecutionRole"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:user/ludovic.lempereur"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:user/geoffray.menudier"
+            - !Ref "AWS::NoValue" # If not prod, no statement
+
+          # Deny Access to all users except specified ones
+          # This statement is only applied in the 'prod' environment.
+          - !If
+            - IsProd
+            - Sid: DenyAllButAllowedUser
+              Effect: Deny
+              Principal: '*'
+              Action: 's3:*'
+              Resource:
+                - !GetAtt RestitutionBucket.Arn
+                - !Sub "${RestitutionBucket.Arn}/*"
+              Condition:
+                StringNotEquals:
+                  aws:userId: !Sub ${AWS::AccountId}
+                ArnNotEquals:
+                  aws:PrincipalArn:
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/aws-reserved/sso.amazonaws.com/eu-central-1/AWSReservedSSO_fr-prod-eu-central-1-admin_f4c13ac1ef030905"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/aws-reserved/sso.amazonaws.com/eu-central-1/AWSReservedSSO_fr_prod_data_engineer_cc3919e7405e2c99"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/after-banking-${Service}-${Env}-CloudFormationExecutionRole"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:user/ludovic.lempereur"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:user/geoffray.menudier"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-zip-lambda-exec-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-restitution-stepfunction-exec-main-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-extraction-parquet-to-flat-lambda-exec-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-common-extraction-parquet-to-flat-lambda-exec-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-unload-partitioned-data-lambda-ex-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-scenario-extractions-lambda-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-extraction-doc-lambda-exec-role"
+            - !Ref "AWS::NoValue" # If not prod, no statement
+
+          # Deny Access to all users except admin and specified ones
+          # This statement is only applied in the 'prod' environment
+          - !If
+            - IsProd
+            - Sid: DenyWriteAllButAdminAndRootUsers
+              Effect: Deny
+              Principal: '*'
+              NotAction:
+                - s3:List*
+                - s3:Get*
+              Resource:
+                - !GetAtt RestitutionBucket.Arn
+                - !Sub "${RestitutionBucket.Arn}/*"
+              Condition:
+                StringNotEquals:
+                  aws:userId: !Sub ${AWS::AccountId}
+                ArnNotEquals:
+                  aws:PrincipalArn:
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/aws-reserved/sso.amazonaws.com/eu-central-1/AWSReservedSSO_fr-prod-eu-central-1-admin_f4c13ac1ef030905"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/after-banking-${Service}-${Env}-CloudFormationExecutionRole"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:user/ludovic.lempereur"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:user/geoffray.menudier"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-zip-lambda-exec-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-restitution-stepfunction-exec-main-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-extraction-parquet-to-flat-lambda-exec-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-common-extraction-parquet-to-flat-lambda-exec-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-unload-partitioned-data-lambda-ex-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-scenario-extractions-lambda-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/fr-${Env}-${AWS::Region}-extraction-doc-lambda-exec-role"
+            - !Ref "AWS::NoValue" # If not prod, no statement
+          # Grant Access to the Root Account
+          - Sid: AllowRootAccountAccess
+            Effect: Allow
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt RestitutionBucket.Arn
+              - !Sub "${RestitutionBucket.Arn}/*"
+            Condition:
+              StringEquals:
+                  aws:userId: !Sub ${AWS::AccountId}
+
+Outputs:
+  AthenaQueryResultsBucketArn:
+    Description: "The ARN of the Athena Query Results Bucket."
+    Value: !GetAtt AthenaQueryResultsBucket.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-AthenaQueryResultsBucketArn"
+
+  AthenaQueryResultsBucketName:
+    Description: "The Name of the Athena Query Results Bucket."
+    Value: !Ref AthenaQueryResultsBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-AthenaQueryResultsBucketName"
+
+  GoldBucketArn:
+    Description: "The ARN of the Gold Bucket."
+    Value: !GetAtt GoldBucket.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-GoldBucketArn"
+
+  GoldBucketName:
+    Description: "The Name of the Gold Bucket."
+    Value: !Ref GoldBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-GoldBucketName"
+
+  KnowledgeBaseBucketArn:
+    Description: "The ARN of the Knowledge Base Bucket."
+    Value: !GetAtt KnowledgeBaseBucket.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-KnowledgeBaseBucketArn"
+
+  KnowledgeBaseBucketName:
+    Description: "The Name of the Knowledge Base Bucket."
+    Value: !Ref KnowledgeBaseBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-KnowledgeBaseBucketName"
+
+  CorporateBucketArn:
+    Description: "The ARN of the Corporate Bucket."
+    Value: !GetAtt CorporateBucket.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-CorporateBucketArn"
+
+  CorporateBucketName:
+    Description: "The Name of the Corporate Bucket."
+    Value: !Ref CorporateBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-CorporateBucketName"
+
+  RestitutionBucketArn:
+    Description: "The ARN of the Restitution Bucket."
+    Value: !GetAtt RestitutionBucket.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-RestitutionBucketArn"
+
+  RestitutionBucketName:
+    Description: "The Name of the Restitution Bucket."
+    Value: !Ref RestitutionBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-RestitutionBucketName"

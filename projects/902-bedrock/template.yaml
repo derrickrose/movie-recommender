@@ -1,0 +1,122 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: 'AWS::Serverless-2016-10-31'
+Description: "Lambda used to orchestrate the AI-based video recommendation system"
+
+Metadata:
+  Version: 0.0.1
+
+Parameters:
+  Env:
+    Type: String
+    Default: dev
+    Description: The environment to deploy the stack to
+    AllowedValues:
+      - prod
+      - dev
+  LogLevel:
+    Description: Logging level
+    Type: String
+    Default: INFO
+  LambdaName:
+    Description: Lambda Function Name
+    Type: String
+    Default: "lambda-orchestrator"
+
+
+
+Conditions:
+  IsDev: !Equals [ !Ref Env, 'dev' ]
+  IsProd: !Equals [ !Ref Env, 'prod' ]
+
+Resources:
+  LambdaOrchestratorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupClass: STANDARD
+      LogGroupName: !Sub /aws/lambda/fr-${Env}-${AWS::Region}-${LambdaName}-logs
+
+  OrchestratorLambdaExecRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: The execution role of the orchestrator lambda function
+      RoleName: !Sub "fr-${Env}-${AWS::Region}-${LambdaName}-exec-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: "AssumeRole"
+            Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Policies:
+        - PolicyName: AllowPutLogPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: "AllowPutLog"
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - 'arn:aws:logs:*:*:*'
+        - PolicyName: AllowReadS3Policy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: "AllowReadS3"
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:GetObjectTagging
+                  - s3:GetObjectVersion
+                  - s3:GetBucketLocation
+                Resource:
+                  - !Sub 'arn:aws:s3:::fr-${Env}-${AWS::Region}-after-banking-restitution'
+                  - !Sub 'arn:aws:s3:::fr-${Env}-${AWS::Region}-after-banking-restitution/*'
+        - PolicyName: AllowPutS3Policy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: "AllowPutS3"
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource:
+                  - !Sub 'arn:aws:s3:::fr-${Env}-${AWS::Region}-after-banking-restitution'
+                  - !Sub 'arn:aws:s3:::fr-${Env}-${AWS::Region}-after-banking-restitution/*'
+  LambdaOrchestrator:
+    DependsOn:
+      - OrchestratorLambdaExecRole
+      - LambdaOrchestratorLogGroup
+    Type: AWS::Serverless::Function
+    Properties:
+      Role: !GetAtt OrchestratorLambdaExecRole.Arn
+      Architectures:
+        - !Ref EnvArchitecture
+      FunctionName: !Sub fr-${Env}-${AWS::Region}-${LambdaName}
+      CodeUri: src/
+      Handler: orchestrator.lambda_handler
+      Runtime: !Ref LambdaRuntime
+      LoggingConfig:
+        ApplicationLogLevel: !Ref LogLevel
+        LogFormat: JSON
+        LogGroup: !Sub /aws/lambda/fr-${Env}-${AWS::Region}-lambda-extraction-parquets-fo-flat-logs
+        SystemLogLevel: !Ref LogLevel
+      MemorySize: 10240
+      Environment:
+        Variables:
+          LOG_LEVEL: !Ref LogLevel
+          TEMP_FOLDERS: !Ref TempFolders
+          ATHENA_QUERY_RESULTS: !Ref AthenaQueryResults
+          VALID_TARGET_FILE_EXTENSIONS: !Ref ValidTargetFileExtensions
+          DATAFRAME_ROWS_LIMIT: !Ref DataFrameRowsLimit
+          QUERY_FILTERING_ATTRIBUTES: !Ref QueryFilteringAttributes
+          ATTRIBUTES_TO_ADD_ON_FILE_NAME: !Ref AttributesToAddOnFileName
+      Timeout: 800
+      EventInvokeConfig:
+        MaximumRetryAttempts: 0

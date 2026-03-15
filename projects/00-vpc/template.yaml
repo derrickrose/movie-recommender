@@ -1,0 +1,242 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: >-
+  AWS CloudFormation VPC Template
+
+Metadata:
+  Version: 0.0.1
+
+Parameters:
+  Env:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    Description: Environment name (dev, staging, or prod)
+Resources:
+  # VPC
+  VPC:
+    Type: 'AWS::EC2::VPC'
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${Env}-miketriky-vpc'
+
+  # Internet Gateway
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${Env}-miketriky-vpc-igw'
+  AttachInternetGateway:
+    Type: 'AWS::EC2::VPCGatewayAttachment'
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # S3 VPC Endpoint
+  S3VPCEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.s3'
+      VpcEndpointType: Gateway
+      RouteTableIds:
+        - !Ref RouteTablePrivateA
+        - !Ref RouteTablePrivateB
+  # Security Group for MWAA
+  MWAASecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for MWAA environment
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${Env}-miketriky-vpc-sg-mwaa'
+  MWAASecurityGroupIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref MWAASecurityGroup
+      IpProtocol: -1
+      SourceSecurityGroupId: !Ref MWAASecurityGroup
+      Description: Allow all traffic from itself
+  MWAASecurityGroupEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref MWAASecurityGroup
+      IpProtocol: -1
+      CidrIp: 0.0.0.0/0
+      Description: Allow all outbound traffic
+
+  # Public Subnet A
+  SubnetPublicA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone: eu-west-3a
+      CidrBlock: 10.0.100.0/24
+      Tags:
+        - Key: Name
+          Value: !Sub '${Env}-miketriky-vpc-subnet-public-a'
+      VpcId: !Ref VPC
+  RouteTablePublicA:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+      - Key: Name
+        Value: !Sub '${Env}-miketriky-vpc-rtb-public-a'
+  AttachRouteTablePublicA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref SubnetPublicA
+      RouteTableId: !Ref RouteTablePublicA
+  RoutePublicA:
+    Type: AWS::EC2::Route
+    DependsOn: AttachRouteTablePublicA
+    Properties:
+       RouteTableId: !Ref RouteTablePublicA
+       DestinationCidrBlock: 0.0.0.0/0
+       GatewayId: !Ref InternetGateway
+
+  # Public Subnet B
+  SubnetPublicB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone: eu-west-3b
+      CidrBlock: 10.0.101.0/24
+      Tags:
+        - Key: Name
+          Value: !Sub '${Env}-miketriky-vpc-subnet-public-b'
+      VpcId: !Ref VPC
+  RouteTablePublicB:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+      - Key: Name
+        Value: !Sub '${Env}-miketriky-vpc-rtb-public-b'
+  AttachRouteTablePublicB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref SubnetPublicB
+      RouteTableId: !Ref RouteTablePublicB
+  RoutePublicB:
+    Type: AWS::EC2::Route
+    DependsOn: AttachRouteTablePublicB
+    Properties:
+       RouteTableId: !Ref RouteTablePublicB
+       DestinationCidrBlock: 0.0.0.0/0
+       GatewayId: !Ref InternetGateway
+
+  # Private Subnet A
+  SubnetPrivateA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone: eu-west-3a
+      CidrBlock: 10.0.0.0/24
+      Tags:
+        - Key: Name
+          Value: !Sub '${Env}-miketriky-vpc-subnet-private-a'
+      VpcId: !Ref VPC
+  ElasticIpA:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+  NatGatewayA:
+    DependsOn: AttachInternetGateway
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt ElasticIpA.AllocationId
+      SubnetId: !Ref SubnetPublicA
+      Tags:
+        - Key: Name
+          Value: !Sub '${Env}-miketriky-vpc-natgw-a'
+  RouteTablePrivateA:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+      - Key: Name
+        Value: !Sub '${Env}-miketriky-vpc-rtb-private-a'
+  AttachRouteTablePrivateA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref SubnetPrivateA
+      RouteTableId: !Ref RouteTablePrivateA
+  RoutePrivateA:
+    Type: AWS::EC2::Route
+    DependsOn: AttachRouteTablePrivateA
+    Properties:
+       RouteTableId: !Ref RouteTablePrivateA
+       DestinationCidrBlock: 0.0.0.0/0
+       NatGatewayId: !Ref NatGatewayA
+
+  # Private Subnet B
+  SubnetPrivateB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone: eu-west-3b
+      CidrBlock: 10.0.1.0/24
+      Tags:
+        - Key: Name
+          Value: !Sub '${Env}-miketriky-vpc-subnet-private-b'
+      VpcId: !Ref VPC
+  ElasticIpB:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+  NatGatewayB:
+    DependsOn: AttachInternetGateway
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt ElasticIpB.AllocationId
+      SubnetId: !Ref SubnetPublicB
+      Tags:
+        - Key: Name
+          Value: !Sub '${Env}-miketriky-vpc-natgw-b'
+  RouteTablePrivateB:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+      - Key: Name
+        Value: !Sub '${Env}-miketriky-vpc-rtb-private-b'
+  AttachRouteTablePrivateB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref SubnetPrivateB
+      RouteTableId: !Ref RouteTablePrivateB
+  RoutePrivateB:
+    Type: AWS::EC2::Route
+    DependsOn: AttachRouteTablePrivateB
+    Properties:
+       RouteTableId: !Ref RouteTablePrivateB
+       DestinationCidrBlock: 0.0.0.0/0
+       NatGatewayId: !Ref NatGatewayB
+
+Outputs:
+  VPCId:
+    Description: VPC ID
+    Value: !Ref VPC
+    Export:
+      Name: !Sub '${Env}-miketriky-vpc-id'
+  PrivateSubnetAId:
+    Description: Private Subnet A ID
+    Value: !Ref SubnetPrivateA
+    Export:
+      Name: !Sub '${Env}-miketriky-vpc-subnet-private-a-id'
+  PrivateSubnetBId:
+    Description: Private Subnet B ID
+    Value: !Ref SubnetPrivateB
+    Export:
+      Name: !Sub '${Env}-miketriky-vpc-subnet-private-b-id'
+  MWAASecurityGroupId:
+    Description: MWAA Security Group ID
+    Value: !Ref MWAASecurityGroup
+    Export:
+      Name: !Sub '${Env}-miketriky-vpc-sg-mwaa-id'
